@@ -1,0 +1,31 @@
+# Git
+.git
+.gitignore
+
+# Docker
+Dockerfile
+docker-compose.yml
+.dockerignore
+
+# Builds
+node_modules
+.next
+
+# IDE files
+.idea
+.vscode
+*.iml
+*.ipr
+*.iws
+.notes.md
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Environment files
+.env
+.env.*

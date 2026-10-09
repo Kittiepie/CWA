@@ -1,0 +1,13 @@
+cd loadtest
+npm start -- --users 10 --duration 20 --ramp 5 --start-delay 0     # quick smoke test first
+npm start -- --users 100                                            # realistic: 30% drawing
+npm start -- --users 100 --active 1                                 # worst case: everyone draws
+npm start -- --scenario contention --users 100 --active 1 --action-interval 1.5
+
+
+What the report shows
+Board ops: how many were delivered out of how many should have been, plus p50/p95/p99 latency.
+Cursors and drafts: loss rate, latency, and how many drafts were too big to send at all. The size limit is read from the connection, not guessed.
+PASS/FAIL targets: everyone connected, ops delivered ≥ 99.5%, op p95 ≤ 250 ms, datagram loss ≤ 5%.
+Load generator health: if the bots' own processes fell behind, the report says so, because that inflates every latency. Your mentor is likely to ask about this.
+Convergence (contention scenario only): after the fight over shared shapes, it checks each client's view against the server's final state. It does this twice: once the way the frontend applies updates today (whatever arrives last wins), and once with a timestamp check. I expect the frontend version to show some clients ending up with the wrong position or size, but that hasn't been measured yet.

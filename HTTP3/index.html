@@ -1,0 +1,862 @@
+<!doctype html>
+<html lang="vi">
+  <head>
+    <meta charset="utf-8" />
+    <title>CWA Demo — WebTransport + CRDT + Redis</title>
+    <style>
+      body {
+        font-family: system-ui, sans-serif;
+        padding: 16px;
+      }
+      canvas {
+        border: 1px solid #333;
+        cursor: crosshair;
+        margin-top: 10px;
+      }
+      #toolbar {
+        display: flex;
+        gap: 6px;
+        flex-wrap: wrap;
+        align-items: center;
+        margin-bottom: 8px;
+      }
+      #toolbar button.active {
+        background: #1f2937;
+        color: #fff;
+        border-color: #1f2937;
+      }
+      .fontsizes button.active {
+        background: #1f2937;
+        color: #fff;
+        border-color: #1f2937;
+      }
+      .colors button {
+        width: 28px;
+        height: 28px;
+        border: 2px solid #999;
+        cursor: pointer;
+        margin-right: 4px;
+      }
+      button {
+        cursor: pointer;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="toolbar">
+      <button data-tool="select" class="active">🖱 Chọn</button>
+      <button data-tool="rectangle">▭ Chữ nhật</button>
+      <button data-tool="diamond">◇ Kim cương</button>
+      <button data-tool="ellipse">◯ Hình elip</button>
+      <button data-tool="line">／ Đường thẳng</button>
+      <button data-tool="freedraw">✏️ Vẽ tự do</button>
+      <button data-tool="text">🔤 Textbox</button>
+      <button id="reloadBtn">🔄 Tải lại trạng thái (giả lập join phòng)</button>
+    </div>
+    <p>
+      Màu vẽ (dùng cho nét mới, hoặc tô lại phần tử đang chọn):
+      <span class="colors">
+        <button data-color="#1f2937" style="background: #1f2937"></button>
+        <button data-color="#ef4444" style="background: #ef4444"></button>
+        <button data-color="#3b82f6" style="background: #3b82f6"></button>
+        <button data-color="#22c55e" style="background: #22c55e"></button>
+        <button data-color="#eab308" style="background: #eab308"></button>
+      </span>
+      &nbsp;·&nbsp; Cỡ chữ (textbox):
+      <span class="fontsizes">
+        <button data-fontsize="14">14</button>
+        <button data-fontsize="18" class="active">18</button>
+        <button data-fontsize="24">24</button>
+        <button data-fontsize="32">32</button>
+      </span>
+    </p>
+    <p style="color: #666; font-size: 14px">
+      Chọn công cụ ở trên · kéo thả để vẽ hình/đường thẳng/nét tự do/textbox ·
+      dùng công cụ "Chọn" để di chuyển hoặc tô lại màu/cỡ chữ · phím
+      Delete/Backspace để xoá phần tử đang chọn
+    </p>
+    <canvas id="board" width="500" height="350"></canvas>
+
+    <p>
+      <label
+        ><input type="checkbox" id="lossSim" /> Mô phỏng mất gói Datagram
+        (30%)</label
+      >
+      — 📡 Đã gửi: <b id="dgSent">0</b> · 🚫 Mô phỏng mất:
+      <b id="dgDropped">0</b>
+    </p>
+    <div
+      id="log"
+      style="
+        margin-top: 8px;
+        height: 150px;
+        overflow-y: auto;
+        border: 1px solid #ccc;
+        padding: 8px;
+        font-family: monospace;
+        font-size: 12px;
+        background: #fafafa;
+      "
+    ></div>
+
+    <script>
+      // Mirrors the element/op shapes documented in board-elements.md and
+      // enforced server-side by types.ts. This file is plain JS (no build
+      // step), so the "types" below are just the runtime shape we agree to
+      // send/receive — if this project adopts a bundler later, this file
+      // could import types.ts directly instead of duplicating the contract.
+      const SHAPE_TYPES = ["rectangle", "diamond", "ellipse"];
+      const LINEAR_TYPES = ["line", "freedraw"];
+      const FIELDS_BY_TYPE = {
+        rectangle: ["position", "size", "strokeColor", "backgroundColor"],
+        diamond: ["position", "size", "strokeColor", "backgroundColor"],
+        ellipse: ["position", "size", "strokeColor", "backgroundColor"],
+        line: ["points", "strokeColor"],
+        freedraw: ["points", "strokeColor"],
+        text: ["position", "size", "text", "color", "fontSize"],
+      };
+      // Tools that share the same "drag a box" interaction (shapes + textbox).
+      const BOX_TOOLS = [...SHAPE_TYPES, "text"];
+
+      const canvas = document.getElementById("board");
+      const ctx = canvas.getContext("2d");
+      const clientId = crypto.randomUUID().slice(0, 8);
+
+      // elementId -> { type, deleted, data: {...fields...} }
+      const elements = {};
+
+      let currentTool = "select";
+      let currentColor = "#1f2937";
+      let currentFontSize = 18;
+      let selectedId = null;
+
+      // vẽ hình/đường mới
+      let isDrawing = false;
+      let drawStart = null; // {x,y} — mousedown, dùng cho công cụ shape
+      let lastMouse = null; // vị trí chuột mới nhất, dùng để preview shape
+      let currentStroke = []; // điểm đang gom cho line/freedraw (cũng là draft gửi qua Datagram)
+
+      // kéo di chuyển phần tử đã chọn
+      let draggingSelectedId = null;
+      let dragAnchor = null; // shape/text: {dx,dy} lệch so với position; line/freedraw: {x,y} điểm chuột trước đó
+
+      let remoteCursor = null; // { x, y } — con trỏ NGƯỜI KHÁC, nhận qua Datagram relay
+      const remoteDrafts = {}; // clientId -> điểm đang vẽ dở của NGƯỜI KHÁC (line/freedraw, chưa thả tay)
+
+      function logEvent(channel, text) {
+        const color = channel === "STREAM" ? "#2563eb" : "#d97706";
+        const line = document.createElement("div");
+        line.innerHTML = `<b style="color:${color}">[${channel}]</b> ${text}`;
+        const logEl = document.getElementById("log");
+        logEl.prepend(line);
+        while (logEl.children.length > 30) logEl.removeChild(logEl.lastChild);
+      }
+
+      // Dán hash sha256 in ra từ console server vào đây
+      const CERT_HASH = "QvCW25DjKtWASwOPZJrlk3gdWjVdDBk4LV/I6cJDQ6E=";
+
+      // ---------------------------------------------------------------
+      // Hình học: hit-test + đường viền cho từng loại phần tử
+      // ---------------------------------------------------------------
+      function pointInRect(px, py, x, y, w, h) {
+        return px >= x && px <= x + w && py >= y && py <= y + h;
+      }
+
+      function pointInEllipse(px, py, cx, cy, rx, ry) {
+        if (rx <= 0 || ry <= 0) return false;
+        const dx = (px - cx) / rx;
+        const dy = (py - cy) / ry;
+        return dx * dx + dy * dy <= 1;
+      }
+
+      function distToSegment(px, py, x1, y1, x2, y2) {
+        const dx = x2 - x1;
+        const dy = y2 - y1;
+        const lenSq = dx * dx + dy * dy;
+        let t = lenSq === 0 ? 0 : ((px - x1) * dx + (py - y1) * dy) / lenSq;
+        t = Math.max(0, Math.min(1, t));
+        return Math.hypot(px - (x1 + t * dx), py - (y1 + t * dy));
+      }
+
+      function hitTestLinear(px, py, points, threshold = 6) {
+        for (let i = 0; i < points.length - 1; i++) {
+          const a = points[i];
+          const b = points[i + 1];
+          if (distToSegment(px, py, a.x, a.y, b.x, b.y) <= threshold)
+            return true;
+        }
+        return false;
+      }
+
+      function shapeBBox(el) {
+        const { position, size } = el.data;
+        if (!position || !size) return null;
+        return { x: position.x, y: position.y, w: size.width, h: size.height };
+      }
+
+      function textBBox(el) {
+        // Text now has an explicit drag-chosen box, same shape as shapeBBox —
+        // kept as its own function since it reads from the same `el.data`
+        // convention and callers ask for it by name (hitTest, rendering).
+        return shapeBBox(el);
+      }
+
+      function wrapText(text, maxWidth) {
+        // ctx.font must already be set by the caller before calling this.
+        const words = text.split(/\s+/);
+        const lines = [];
+        let line = "";
+        for (const word of words) {
+          const attempt = line ? `${line} ${word}` : word;
+          if (line && ctx.measureText(attempt).width > maxWidth) {
+            lines.push(line);
+            line = word;
+          } else {
+            line = attempt;
+          }
+        }
+        if (line) lines.push(line);
+        return lines;
+      }
+
+      function hitTest(px, py) {
+        const entries = Object.entries(elements).reverse(); // ưu tiên phần tử vẽ sau (nằm trên)
+        for (const [id, el] of entries) {
+          if (el.deleted || !el.type) continue;
+          if (
+            (SHAPE_TYPES.includes(el.type) && el.type !== "ellipse") ||
+            el.type === "text"
+          ) {
+            const bb = el.type === "text" ? textBBox(el) : shapeBBox(el);
+            if (bb && pointInRect(px, py, bb.x, bb.y, bb.w, bb.h)) return id;
+          } else if (el.type === "ellipse") {
+            const { position, size } = el.data;
+            if (position && size) {
+              const cx = position.x + size.width / 2;
+              const cy = position.y + size.height / 2;
+              if (
+                pointInEllipse(px, py, cx, cy, size.width / 2, size.height / 2)
+              )
+                return id;
+            }
+          } else if (LINEAR_TYPES.includes(el.type)) {
+            if (el.data.points && hitTestLinear(px, py, el.data.points))
+              return id;
+          }
+        }
+        return null;
+      }
+
+      // ---------------------------------------------------------------
+      // Render
+      // ---------------------------------------------------------------
+      function shapePath(type, x, y, w, h) {
+        ctx.beginPath();
+        if (type === "diamond") {
+          ctx.moveTo(x + w / 2, y);
+          ctx.lineTo(x + w, y + h / 2);
+          ctx.lineTo(x + w / 2, y + h);
+          ctx.lineTo(x, y + h / 2);
+          ctx.closePath();
+        } else {
+          ctx.rect(x, y, w, h);
+        }
+      }
+
+      function strokePolyline(points) {
+        if (points.length < 2) return;
+        ctx.beginPath();
+        ctx.moveTo(points[0].x, points[0].y);
+        for (const p of points.slice(1)) ctx.lineTo(p.x, p.y);
+        ctx.stroke();
+      }
+
+      function drawDashedPolyline(points) {
+        if (points.length < 2) return;
+        ctx.save();
+        ctx.strokeStyle = "#9ca3af";
+        ctx.lineWidth = 3;
+        ctx.lineJoin = "round";
+        ctx.lineCap = "round";
+        ctx.setLineDash([2, 2]);
+        strokePolyline(points);
+        ctx.restore();
+      }
+
+      function drawElement(el, selected) {
+        const d = el.data;
+        ctx.lineWidth = 2;
+        if (el.type === "rectangle" || el.type === "diamond") {
+          if (!d.position || !d.size) return;
+          const { x, y } = d.position;
+          const { width: w, height: h } = d.size;
+          if (d.backgroundColor && d.backgroundColor !== "transparent") {
+            ctx.fillStyle = d.backgroundColor;
+            shapePath(el.type, x, y, w, h);
+            ctx.fill();
+          }
+          ctx.strokeStyle = d.strokeColor || "#1f2937";
+          shapePath(el.type, x, y, w, h);
+          ctx.stroke();
+          if (selected) {
+            ctx.strokeStyle = "#000";
+            ctx.setLineDash([3, 3]);
+            shapePath(el.type, x - 3, y - 3, w + 6, h + 6);
+            ctx.stroke();
+            ctx.setLineDash([]);
+          }
+        } else if (el.type === "ellipse") {
+          if (!d.position || !d.size) return;
+          const { x, y } = d.position;
+          const { width: w, height: h } = d.size;
+          const cx = x + w / 2;
+          const cy = y + h / 2;
+          const rx = Math.max(w / 2, 0.01);
+          const ry = Math.max(h / 2, 0.01);
+          if (d.backgroundColor && d.backgroundColor !== "transparent") {
+            ctx.fillStyle = d.backgroundColor;
+            ctx.beginPath();
+            ctx.ellipse(cx, cy, rx, ry, 0, 0, Math.PI * 2);
+            ctx.fill();
+          }
+          ctx.strokeStyle = d.strokeColor || "#1f2937";
+          ctx.beginPath();
+          ctx.ellipse(cx, cy, rx, ry, 0, 0, Math.PI * 2);
+          ctx.stroke();
+          if (selected) {
+            ctx.strokeStyle = "#000";
+            ctx.setLineDash([3, 3]);
+            ctx.beginPath();
+            ctx.ellipse(cx, cy, rx + 3, ry + 3, 0, 0, Math.PI * 2);
+            ctx.stroke();
+            ctx.setLineDash([]);
+          }
+        } else if (el.type === "line" || el.type === "freedraw") {
+          if (!d.points || d.points.length < 2) return;
+          ctx.strokeStyle = d.strokeColor || "#1f2937";
+          ctx.lineWidth = 3;
+          ctx.lineJoin = "round";
+          ctx.lineCap = "round";
+          strokePolyline(d.points);
+          if (selected) {
+            ctx.save();
+            ctx.strokeStyle = "#000";
+            ctx.globalAlpha = 0.25;
+            ctx.lineWidth = 7;
+            strokePolyline(d.points);
+            ctx.restore();
+          }
+        } else if (el.type === "text") {
+          if (!d.position || !d.size || d.text === undefined) return;
+          const fontSize = d.fontSize || 16;
+          const lineHeight = fontSize * 1.2;
+          ctx.fillStyle = d.color || "#1f2937";
+          ctx.font = `${fontSize}px sans-serif`;
+          ctx.textBaseline = "top";
+          const lines = wrapText(d.text, d.size.width);
+          lines.forEach((line, i) =>
+            ctx.fillText(line, d.position.x, d.position.y + i * lineHeight),
+          );
+          if (selected) {
+            ctx.strokeStyle = "#000";
+            ctx.setLineDash([2, 2]);
+            ctx.strokeRect(
+              d.position.x - 2,
+              d.position.y - 2,
+              d.size.width + 4,
+              d.size.height + 4,
+            );
+            ctx.setLineDash([]);
+          }
+        }
+      }
+
+      function drawActivePreview() {
+        if (BOX_TOOLS.includes(currentTool) && drawStart && lastMouse) {
+          const x = Math.min(drawStart.x, lastMouse.x);
+          const y = Math.min(drawStart.y, lastMouse.y);
+          const w = Math.abs(lastMouse.x - drawStart.x);
+          const h = Math.abs(lastMouse.y - drawStart.y);
+          // text previews as a plain box regardless — diamond/ellipse shapes
+          // only make sense for the actual shape tools.
+          const previewShape =
+            currentTool === "text" ? "rectangle" : currentTool;
+          ctx.strokeStyle = "#9ca3af";
+          ctx.setLineDash([2, 2]);
+          shapePath(previewShape, x, y, w, h);
+          ctx.stroke();
+          ctx.setLineDash([]);
+        } else if (
+          LINEAR_TYPES.includes(currentTool) &&
+          currentStroke.length > 1
+        ) {
+          drawDashedPolyline(currentStroke);
+        }
+      }
+
+      function drawRemoteCursor() {
+        ctx.strokeStyle = "#d97706"; // cam — cùng màu nhãn [DATAGRAM] trong log
+        ctx.setLineDash([3, 3]);
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.arc(remoteCursor.x, remoteCursor.y, 8, 0, Math.PI * 2);
+        ctx.stroke();
+        ctx.setLineDash([]);
+      }
+
+      function render() {
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        for (const [id, el] of Object.entries(elements)) {
+          if (el.deleted || !el.type) continue;
+          drawElement(el, id === selectedId);
+        }
+        if (isDrawing) drawActivePreview();
+        for (const pts of Object.values(remoteDrafts)) drawDashedPolyline(pts);
+        if (remoteCursor) drawRemoteCursor();
+      }
+
+      function concatChunks(chunks) {
+        const total = chunks.reduce((sum, c) => sum + c.length, 0);
+        const result = new Uint8Array(total);
+        let offset = 0;
+        for (const c of chunks) {
+          result.set(c, offset);
+          offset += c.length;
+        }
+        return result;
+      }
+
+      // Kiểm tra tối giản cho op nhận từ mạng — không đầy đủ như parseOp()
+      // phía server (xem types.ts), nhưng đủ để không crash khi nhận rác.
+      function isValidIncomingOp(op) {
+        if (!op || typeof op !== "object") return false;
+        if (typeof op.elementId !== "string") return false;
+        if (!Array.isArray(op.time) || op.time.length !== 2) return false;
+        if (op.field === "deleted") return typeof op.value === "boolean";
+        if (typeof op.type !== "string" || !FIELDS_BY_TYPE[op.type])
+          return false;
+        return FIELDS_BY_TYPE[op.type].includes(op.field);
+      }
+
+      function applyOp(op) {
+        if (!isValidIncomingOp(op)) {
+          logEvent("STREAM", `bỏ qua op không hợp lệ`);
+          return;
+        }
+        // Op nào tới qua stream (reliable) từ 1 client cũng đồng nghĩa họ vừa
+        // chốt xong 1 hành động — xoá draft tương ứng nếu có.
+        delete remoteDrafts[op.time[1]];
+
+        if (op.field === "deleted") {
+          if (elements[op.elementId]) elements[op.elementId].deleted = op.value;
+          render();
+          logEvent("STREAM", `nhận từ người khác: deleted → ${op.value}`);
+          return;
+        }
+
+        elements[op.elementId] = elements[op.elementId] || {
+          type: op.type,
+          deleted: false,
+          data: {},
+        };
+        elements[op.elementId].type = op.type;
+        elements[op.elementId].data[op.field] = op.value;
+        render();
+        const preview =
+          op.field === "points"
+            ? `${op.value.length} điểm`
+            : JSON.stringify(op.value);
+        logEvent("STREAM", `nhận từ người khác: ${op.field} → ${preview}`);
+      }
+
+      async function main() {
+        const transport = new WebTransport("https://127.0.0.1:5000/wt", {
+          serverCertificateHashes: [
+            {
+              algorithm: "sha-256",
+              value: Uint8Array.from(atob(CERT_HASH), (c) => c.charCodeAt(0)),
+            },
+          ],
+        });
+
+        await transport.ready;
+        console.log("connected, clientId =", clientId);
+
+        // `type` bị bỏ qua khi field === "deleted" (không gắn với 1 loại cụ thể)
+        async function sendOp(elementId, field, value, type) {
+          const op =
+            field === "deleted"
+              ? { elementId, field, value, time: [Date.now(), clientId] }
+              : { elementId, type, field, value, time: [Date.now(), clientId] };
+          const preview =
+            field === "points" ? `${value.length} điểm` : JSON.stringify(value);
+          logEvent("STREAM", `${field} → ${preview}`);
+          const stream = await transport.createUnidirectionalStream();
+          const writer = stream.getWriter();
+          await writer.write(new TextEncoder().encode(JSON.stringify(op)));
+          await writer.close();
+        }
+
+        // Nhận datagram — có thể là "cursor" hoặc "draft" (nét/đường nháp
+        // đang vẽ dở) của NGƯỜI KHÁC, server relay nguyên xi không đụng nội dung.
+        (async () => {
+          const reader = transport.datagrams.readable.getReader();
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            const msg = JSON.parse(new TextDecoder().decode(value));
+            if (msg.type === "draft") {
+              remoteDrafts[msg.clientId] = msg.points;
+            } else {
+              remoteCursor = { x: msg.x, y: msg.y };
+            }
+            render();
+          }
+        })();
+
+        // Nghe unidirectional stream do SERVER chủ động mở tới mình — kênh
+        // server dùng để đẩy op của người khác về real-time, không cần reload nữa.
+        (async () => {
+          const reader = transport.incomingUnidirectionalStreams.getReader();
+          while (true) {
+            const { done, value: stream } = await reader.read();
+            if (done) break;
+            const sReader = stream.getReader();
+            const chunks = [];
+            while (true) {
+              const { done: d, value } = await sReader.read();
+              if (d) break;
+              chunks.push(value);
+            }
+            const op = JSON.parse(
+              new TextDecoder().decode(concatChunks(chunks)),
+            );
+            applyOp(op);
+          }
+        })();
+
+        async function loadState() {
+          const stream = await transport.createBidirectionalStream();
+          const writer = stream.writable.getWriter();
+          const reader = stream.readable.getReader();
+          await writer.write(new TextEncoder().encode("GET_STATE"));
+          const { value } = await reader.read();
+          const raw = JSON.parse(new TextDecoder().decode(value));
+
+          for (const key in elements) delete elements[key]; // reset trước khi nạp lại
+          for (const [hashField, fieldDataRaw] of Object.entries(raw)) {
+            const sep = hashField.indexOf(":");
+            const id = hashField.slice(0, sep);
+            const field = hashField.slice(sep + 1);
+            const { value: fieldValue } = JSON.parse(fieldDataRaw);
+            elements[id] = elements[id] || {
+              type: undefined,
+              deleted: false,
+              data: {},
+            };
+            if (field === "__type") elements[id].type = fieldValue;
+            else if (field === "deleted") elements[id].deleted = fieldValue;
+            else elements[id].data[field] = fieldValue;
+          }
+          render();
+          console.log(
+            "state loaded:",
+            Object.keys(elements).length,
+            "elements",
+          );
+        }
+
+        await loadState();
+
+        // --- Toolbar: chọn công cụ hiện tại ---
+        document
+          .querySelectorAll("#toolbar button[data-tool]")
+          .forEach((btn) => {
+            btn.addEventListener("click", () => {
+              currentTool = btn.dataset.tool;
+              selectedId = null;
+              document
+                .querySelectorAll("#toolbar button[data-tool]")
+                .forEach((b) => b.classList.toggle("active", b === btn));
+              render();
+            });
+          });
+
+        // --- Vẽ mới / chọn & kéo di chuyển ---
+        canvas.addEventListener("mousedown", (e) => {
+          const x = e.offsetX;
+          const y = e.offsetY;
+
+          if (currentTool === "select") {
+            const hit = hitTest(x, y);
+            selectedId = hit;
+            draggingSelectedId = hit;
+            if (hit) {
+              const el = elements[hit];
+              if (LINEAR_TYPES.includes(el.type) && el.data.points) {
+                dragAnchor = { x, y };
+              } else if (el.data.position) {
+                dragAnchor = {
+                  dx: x - el.data.position.x,
+                  dy: y - el.data.position.y,
+                };
+              } else {
+                draggingSelectedId = null; // dữ liệu chưa đủ để kéo (chưa merge xong)
+              }
+            }
+            render();
+            return;
+          }
+
+          // Shapes VÀ textbox đều dùng chung thao tác "kéo để chọn vùng"
+          if (BOX_TOOLS.includes(currentTool)) {
+            isDrawing = true;
+            drawStart = { x, y };
+            lastMouse = { x, y };
+            selectedId = null;
+            render();
+            return;
+          }
+
+          if (LINEAR_TYPES.includes(currentTool)) {
+            isDrawing = true;
+            currentStroke = [{ x, y }];
+            selectedId = null;
+            render();
+          }
+        });
+
+        canvas.addEventListener("mousemove", (e) => {
+          const x = e.offsetX;
+          const y = e.offsetY;
+          lastMouse = { x, y };
+
+          if (draggingSelectedId) {
+            const el = elements[draggingSelectedId];
+            if (LINEAR_TYPES.includes(el.type)) {
+              const ddx = x - dragAnchor.x;
+              const ddy = y - dragAnchor.y;
+              el.data.points = el.data.points.map((p) => ({
+                x: p.x + ddx,
+                y: p.y + ddy,
+              }));
+              dragAnchor = { x, y };
+            } else if (el.data.position) {
+              el.data.position = { x: x - dragAnchor.dx, y: y - dragAnchor.dy };
+            }
+            render(); // optimistic update — không chờ server
+            return;
+          }
+
+          if (!isDrawing) return;
+
+          if (BOX_TOOLS.includes(currentTool)) {
+            render();
+          } else if (currentTool === "line") {
+            currentStroke = [currentStroke[0], { x, y }];
+            render();
+          } else if (currentTool === "freedraw") {
+            const last = currentStroke[currentStroke.length - 1];
+            const dist = Math.hypot(x - last.x, y - last.y);
+            if (dist < 4) return; // giảm mật độ điểm — tôn trọng ngưỡng payload (NFR)
+            currentStroke.push({ x, y });
+            render();
+          }
+        });
+
+        canvas.addEventListener("mouseup", () => {
+          if (draggingSelectedId) {
+            const id = draggingSelectedId;
+            const el = elements[id];
+            if (LINEAR_TYPES.includes(el.type)) {
+              sendOp(id, "points", el.data.points, el.type); // chỉ gửi 1 lần lúc thả tay
+            } else if (el.data.position) {
+              sendOp(id, "position", el.data.position, el.type);
+            }
+            draggingSelectedId = null;
+            dragAnchor = null;
+            return;
+          }
+
+          if (!isDrawing) return;
+          isDrawing = false;
+
+          if (SHAPE_TYPES.includes(currentTool) && drawStart && lastMouse) {
+            const x = Math.min(drawStart.x, lastMouse.x);
+            const y = Math.min(drawStart.y, lastMouse.y);
+            const w = Math.abs(lastMouse.x - drawStart.x);
+            const h = Math.abs(lastMouse.y - drawStart.y);
+            drawStart = null;
+            if (w < 4 || h < 4) {
+              render();
+              return; // quá nhỏ, coi như kéo nhầm
+            }
+            const id = crypto.randomUUID().slice(0, 8);
+            const type = currentTool;
+            elements[id] = {
+              type,
+              deleted: false,
+              data: {
+                position: { x, y },
+                size: { width: w, height: h },
+                strokeColor: currentColor,
+                backgroundColor: "transparent",
+              },
+            };
+            selectedId = id;
+            render();
+            sendOp(id, "position", { x, y }, type);
+            sendOp(id, "size", { width: w, height: h }, type);
+            sendOp(id, "strokeColor", currentColor, type);
+            sendOp(id, "backgroundColor", "transparent", type);
+          } else if (currentTool === "text" && drawStart && lastMouse) {
+            const x = Math.min(drawStart.x, lastMouse.x);
+            const y = Math.min(drawStart.y, lastMouse.y);
+            const w = Math.abs(lastMouse.x - drawStart.x);
+            const h = Math.abs(lastMouse.y - drawStart.y);
+            drawStart = null;
+            if (w < 10 || h < 10) {
+              render();
+              return; // hộp quá nhỏ, coi như kéo nhầm
+            }
+            const text = prompt("Nội dung textbox:");
+            if (!text || !text.trim()) {
+              render();
+              return;
+            }
+            const id = crypto.randomUUID().slice(0, 8);
+            elements[id] = {
+              type: "text",
+              deleted: false,
+              data: {
+                position: { x, y },
+                size: { width: w, height: h },
+                text,
+                color: currentColor,
+                fontSize: currentFontSize,
+              },
+            };
+            selectedId = id;
+            render();
+            sendOp(id, "position", { x, y }, "text");
+            sendOp(id, "size", { width: w, height: h }, "text");
+            sendOp(id, "text", text, "text");
+            sendOp(id, "color", currentColor, "text");
+            sendOp(id, "fontSize", currentFontSize, "text");
+          } else if (
+            LINEAR_TYPES.includes(currentTool) &&
+            currentStroke.length > 1
+          ) {
+            const id = crypto.randomUUID().slice(0, 8);
+            const type = currentTool;
+            elements[id] = {
+              type,
+              deleted: false,
+              data: { points: currentStroke, strokeColor: currentColor },
+            };
+            selectedId = id;
+            render();
+            sendOp(id, "points", currentStroke, type);
+            sendOp(id, "strokeColor", currentColor, type);
+          }
+
+          currentStroke = [];
+          render();
+        });
+
+        // --- Tô màu: áp dụng cho nét mới, và tô lại ngay phần tử đang chọn nếu có ---
+        document
+          .querySelectorAll(".colors button[data-color]")
+          .forEach((btn) => {
+            btn.addEventListener("click", () => {
+              currentColor = btn.dataset.color;
+              if (selectedId && elements[selectedId]) {
+                const el = elements[selectedId];
+                const field = el.type === "text" ? "color" : "strokeColor";
+                el.data[field] = currentColor;
+                render();
+                sendOp(selectedId, field, currentColor, el.type);
+              }
+            });
+          });
+
+        // --- Cỡ chữ: áp dụng cho textbox mới, và đổi ngay cỡ chữ của textbox đang chọn ---
+        document
+          .querySelectorAll(".fontsizes button[data-fontsize]")
+          .forEach((btn) => {
+            btn.addEventListener("click", () => {
+              currentFontSize = Number(btn.dataset.fontsize);
+              document
+                .querySelectorAll(".fontsizes button[data-fontsize]")
+                .forEach((b) => b.classList.toggle("active", b === btn));
+              if (
+                selectedId &&
+                elements[selectedId] &&
+                elements[selectedId].type === "text"
+              ) {
+                elements[selectedId].data.fontSize = currentFontSize;
+                render();
+                sendOp(selectedId, "fontSize", currentFontSize, "text");
+              }
+            });
+          });
+
+        // --- Xoá phần tử đang chọn (soft delete — khớp board_elements.deleted) ---
+        window.addEventListener("keydown", (e) => {
+          if (
+            (e.key === "Delete" || e.key === "Backspace") &&
+            selectedId &&
+            document.activeElement === document.body
+          ) {
+            e.preventDefault();
+            const id = selectedId;
+            elements[id].deleted = true;
+            selectedId = null;
+            render();
+            sendOp(id, "deleted", true); // không có `type` — deleted áp dụng cho mọi loại phần tử
+          }
+        });
+
+        document
+          .getElementById("reloadBtn")
+          .addEventListener("click", loadState);
+
+        // --- Datagram: gửi cursor HOẶC nét/đường nháp đang vẽ dở, throttle nhẹ —
+        // KHÔNG liên quan tới Redis, mất gói vẫn ổn. Chỉ line/freedraw có "draft";
+        // shape đang kéo chỉ preview cục bộ, chưa phát cho người khác (xem board-elements.md). ---
+        let lastSent = 0;
+        let dgSentCount = 0;
+        let dgDroppedCount = 0;
+        const dgSentEl = document.getElementById("dgSent");
+        const dgDroppedEl = document.getElementById("dgDropped");
+
+        canvas.addEventListener("mousemove", async (e) => {
+          if (Date.now() - lastSent < 100) return;
+          lastSent = Date.now();
+
+          // Mô phỏng mất gói: cố tình KHÔNG gửi — minh hoạ "mất vài gói vẫn ổn"
+          if (
+            document.getElementById("lossSim").checked &&
+            Math.random() < 0.3
+          ) {
+            dgDroppedEl.textContent = ++dgDroppedCount;
+            return;
+          }
+
+          dgSentEl.textContent = ++dgSentCount;
+
+          const sendingDraft = isDrawing && LINEAR_TYPES.includes(currentTool);
+          const payload = sendingDraft
+            ? { type: "draft", clientId, points: currentStroke }
+            : { type: "cursor", clientId, x: e.offsetX, y: e.offsetY };
+
+          const w = transport.datagrams.writable.getWriter();
+          await w.write(new TextEncoder().encode(JSON.stringify(payload)));
+          w.releaseLock();
+        });
+      }
+
+      main().catch(console.error);
+    </script>
+  </body>
+</html>

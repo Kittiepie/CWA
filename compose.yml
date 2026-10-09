@@ -1,0 +1,191 @@
+services:
+  postgres:
+    image: "postgres:17"
+    environment:
+      POSTGRES_DB: ${DB_NAME}
+      POSTGRES_USER: ${DB_USER}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    ports:
+      - "${DB_PORT}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h localhost -U ${DB_USER} -d ${DB_NAME}"]
+      interval: ${DB_HEALTHCHECK_INTERVAL}
+      timeout: ${DB_HEALTHCHECK_TIMEOUT}
+      retries: ${DB_HEALTHCHECK_RETRIES}
+
+  redis:
+    image: redis:7-alpine
+    command: redis-server --appendonly yes --requirepass "${REDIS_PASSWORD}"
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+    volumes:
+      - redis-data:/data
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASSWORD\" ping | grep -q PONG"]
+      interval: ${REDIS_HEALTHCHECK_INTERVAL}
+      timeout: ${REDIS_HEALTHCHECK_TIMEOUT}
+      retries: ${REDIS_HEALTHCHECK_RETRIES}
+
+  http3:
+    build:
+      context: ./HTTP3
+      dockerfile: Dockerfile
+    image: cwa-http3:latest
+    environment:
+      WEB_URL: ${WEB_URL}
+      API_URL: ${API_URL}
+      HTTP3_URL: ${HTTP3_URL}
+      REDIS_URL: redis://:${REDIS_PASSWORD}@${REDIS_HOST}:${REDIS_PORT}
+      REDIS_HOST: ${REDIS_HOST}
+      REDIS_PORT: ${REDIS_PORT}
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+      HTTP3_CERT_FILE_PATH: ${HTTP3_CERT_FILE_PATH}
+      HTTP3_KEY_FILE_PATH: ${HTTP3_KEY_FILE_PATH}
+      HTTP3_HOST: ${HTTP3_HOST}
+      HTTP3_SECRET: ${HTTP3_SECRET}
+    ports:
+      - "5000:5000/udp"
+    depends_on:
+      redis:
+        condition: service_healthy
+    volumes:
+      - /etc/letsencrypt/live:/etc/letsencrypt/live:ro
+      - /etc/letsencrypt/archive:/etc/letsencrypt/archive:ro
+      - ./HTTP3/certs:/app/certs:ro
+
+  api:
+    build:
+      context: ./API
+      dockerfile: Dockerfile
+    image: cwa-api:latest
+    environment:
+      WEB_URL: ${WEB_URL}
+      API_URL: ${API_URL}
+      HTTP3_URL: ${HTTP3_URL}
+      DB_URI: postgres://${DB_USER}:${DB_PASSWORD}@${DB_HOST}:${DB_PORT}/${DB_NAME}
+      DB_NAME: ${DB_NAME}
+      DB_USER: ${DB_USER}
+      DB_PASSWORD: ${DB_PASSWORD}
+      DB_HOST: ${DB_HOST}
+      DB_PORT: ${DB_PORT}
+      CORS_ORIGINS: ${WEB_URL}
+      JWT_SECRET: ${JWT_SECRET}
+      REFRESH_TOKEN_EXPIRATION_SECONDS: ${REFRESH_TOKEN_EXPIRATION_SECONDS}
+      ACCESS_TOKEN_EXPIRATION_SECONDS: ${ACCESS_TOKEN_EXPIRATION_SECONDS}
+      REDIS_URL: redis://:${REDIS_PASSWORD}@${REDIS_HOST}:${REDIS_PORT}
+      REDIS_HOST: ${REDIS_HOST}
+      REDIS_PORT: ${REDIS_PORT}
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+    ports:
+      - "4000:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:8080/health').then(r => { if (!r.ok) process.exit(1) })"]
+      interval: ${API_HEALTHCHECK_INTERVAL}
+      timeout: ${API_HEALTHCHECK_TIMEOUT}
+      retries: ${API_HEALTHCHECK_RETRIES}
+
+  web:
+    build:
+      context: ./WEB
+      dockerfile: Dockerfile
+      args:
+        NEXT_PUBLIC_WEB_URL: ${WEB_URL}
+        NEXT_PUBLIC_API_URL: ${API_URL}
+        NEXT_PUBLIC_HTTP3_URL: ${HTTP3_URL}
+    image: cwa-web:latest
+    environment:
+      WEB_URL: ${WEB_URL}
+      API_URL: ${API_URL}
+      HTTP3_URL: ${HTTP3_URL}
+    ports:
+      - "3000:8080"
+    depends_on:
+      api:
+        condition: service_healthy
+
+  # === TOOLS ===
+  # Use `docker compose --profile tools build` to build the tools, then run them individually
+  # For example: `docker compose run --rm db-migrate-sql`
+
+  # Syncs the database with the entity files within the src using TypeORM's datasource sync
+  db-sync-api:
+    image: cwa-api:latest
+    profiles: ["tools"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      WEB_URL: ${WEB_URL}
+      API_URL: ${API_URL}
+      HTTP3_URL: ${HTTP3_URL}
+      DB_URI: postgres://${DB_USER}:${DB_PASSWORD}@${DB_HOST}:${DB_PORT}/${DB_NAME}
+      DB_NAME: ${DB_NAME}
+      DB_USER: ${DB_USER}
+      DB_PASSWORD: ${DB_PASSWORD}
+      DB_HOST: ${DB_HOST}
+      DB_PORT: ${DB_PORT}
+      CORS_ORIGINS: ${WEB_URL}
+      JWT_SECRET: ${JWT_SECRET}
+      REFRESH_TOKEN_EXPIRATION_SECONDS: ${REFRESH_TOKEN_EXPIRATION_SECONDS}
+      ACCESS_TOKEN_EXPIRATION_SECONDS: ${ACCESS_TOKEN_EXPIRATION_SECONDS}
+      REDIS_URL: redis://:${REDIS_PASSWORD}@${REDIS_HOST}:${REDIS_PORT}
+      REDIS_HOST: ${REDIS_HOST}
+      REDIS_PORT: ${REDIS_PORT}
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+    restart: "no"
+    command: node dist/common/jobs/sync.js
+
+  # Runs the schema file 01-schema.sql against the database
+  db-schema-sql:
+    image: 'postgres:17'
+    profiles: ['tools']
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./scripts:/scripts:ro
+    restart: "no"
+    environment:
+      PGPASSWORD: ${DB_PASSWORD}
+    command: >
+      sh -ec "
+        echo 'Running sql schema file...';
+        psql --host=postgres --username=${DB_USER} --dbname=${DB_NAME} --file=/scripts/01-schema.sql;
+        echo 'Done creating schema';
+      "
+
+  # Runs the seed file 02-seed.sql against the database
+  db-seed-sql:
+    image: 'postgres:17'
+    profiles: ['tools']
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./scripts:/scripts:ro
+    restart: "no"
+    environment:
+      PGPASSWORD: ${DB_PASSWORD}
+    command: >
+      sh -ec "
+        echo 'Running sql seed file...';
+        psql --host=postgres --username=${DB_USER} --dbname=${DB_NAME} --file=/scripts/02-seed.sql;
+        echo 'Seed complete';
+
+        echo 'Running admin sql seed file...';
+        psql --host=postgres --username=${DB_USER} --dbname=${DB_NAME} --file=/scripts/03-admin-seed.sql;
+        echo 'Seed complete';
+      "
+
+volumes:
+  db-data:
+  redis-data:

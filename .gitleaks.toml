@@ -1,0 +1,13 @@
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Committed example env templates"
+paths = [
+  '''env-example\.txt''',
+  '''env-development-example\.txt''',
+  '''.*\.env\.development$''',
+  '''README\.md''',
+  '''.*\.env\.example$''',
+  '''.*\.example\.txt$''',
+]

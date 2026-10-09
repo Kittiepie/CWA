@@ -1,0 +1,1 @@
+-- Optional SQL-level schema migration, not preferred over api-level migration

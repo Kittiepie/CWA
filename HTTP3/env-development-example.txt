@@ -1,0 +1,16 @@
+# For development use only
+# Copy this file to .env in the same directory as this file
+
+NODE_ENV=development
+
+REDIS_URL=redis://:TheOilmancer1231231@localhost:6379
+REDIS_HOST=localhost
+REDIS_PORT=6379
+REDIS_PASSWORD=TheOilmancer1231231
+
+CERT_FILE_PATH=./certs/cert.pem
+KEY_FILE_PATH=./certs/key.pem
+HTTP3_HOST=http3
+HTTP3_SECRET=ReallyLongHTTP3SecretThatShouldBeReplacedForProductionOrElseYouWillAlsoBeSmote
+
+PORT=5000

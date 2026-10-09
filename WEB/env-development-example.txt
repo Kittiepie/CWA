@@ -1,0 +1,11 @@
+# For development use only
+# Copy this file to .env in the same directory as this file
+
+NODE_ENV=development
+
+NEXT_PUBLIC_WEB_URL=http://localhost:8080
+NEXT_PUBLIC_API_URL=http://localhost:8081
+NEXT_PUBLIC_HTTP3_URL=https://localhost:5000
+
+# Optional, only use if you use certificate pinning for HTTP3
+# NEXT_PUBLIC_CERT_HASH=
